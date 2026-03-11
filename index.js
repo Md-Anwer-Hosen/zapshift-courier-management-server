@@ -63,6 +63,25 @@ async function run() {
       }
     };
 
+    //admin middlewere-->>
+
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const email = req.decoded?.email;
+
+        const user = await userCollection.findOne({ email });
+
+        if (!user || user.role !== "admin") {
+          return res.status(403).send({ message: "Admin only access" });
+        }
+
+        next();
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Admin verification failed" });
+      }
+    };
+
     // Routes
 
     app.get("/", (req, res) => {
@@ -99,19 +118,143 @@ async function run() {
       res.send(result);
     });
 
+    //find users-->>
+
+    app.get("/users/search", verifyFbToken, async (req, res) => {
+      try {
+        const search = req.query.search || "";
+
+        const query = {
+          $or: [
+            { name: { $regex: search, $options: "i" } },
+            { email: { $regex: search, $options: "i" } },
+          ],
+        };
+
+        const result = await userCollection
+          .find(query)
+          .sort({ created_at: -1 })
+          .limit(20)
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to search users" });
+      }
+    });
+
+    //find role by email -->>
+
+    app.get(
+      "/users/role/:email",
+      verifyFbToken,
+
+      async (req, res) => {
+        const email = req.params.email;
+
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden access" });
+        }
+
+        const user = await userCollection.findOne({ email });
+
+        res.send({ role: user?.role });
+      },
+    );
+
+    //make admin -->>
+
+    app.patch(
+      "/users/make-admin/:id",
+      verifyFbToken,
+      verifyAdmin,
+
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+
+          const targetUser = await userCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!targetUser) {
+            return res.status(404).send({ message: "User not found" });
+          }
+
+          const result = await userCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                role: "admin",
+                promoted_at: new Date().toISOString(),
+              },
+            },
+          );
+
+          res.send({
+            success: true,
+            message: "User is now admin",
+            result,
+          });
+        } catch (error) {
+          console.log(error);
+          res.status(500).send({ message: "Failed to make admin" });
+        }
+      },
+    );
+
+    //demote admin -->>
+
+    app.patch(
+      "/users/remove-admin/:id",
+      verifyFbToken,
+      verifyAdmin,
+
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+
+          const result = await userCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                role: "user",
+                demoted_at: new Date().toISOString(),
+              },
+            },
+          );
+
+          res.send({
+            success: true,
+            message: "Admin changed to user",
+            result,
+          });
+        } catch (error) {
+          console.log(error);
+          res.status(500).send({ message: "Failed to remove admin" });
+        }
+      },
+    );
+
     //save percel to db-->>
 
     app.post("/parcels", verifyFbToken, async (req, res) => {
       try {
         const data = req.body;
+
+        // default status add
+        data.payment_status = "unpaid";
+        data.delivery_status = "not_collected";
+
         const result = await parcelCollection.insertOne(data);
+
         res.status(201).send(result);
       } catch (err) {
         console.log("Error inserting parcel :", err);
-        res.send(500).send({ message: "Failed to create parcel" });
+        res.status(500).send({ message: "Failed to create parcel" });
       }
     });
-
     // Get all parcels from database (email)-->>
 
     app.get("/parcels/:email", verifyFbToken, async (req, res) => {
@@ -165,8 +308,10 @@ async function run() {
 
     app.delete("/parcels/:id", verifyFbToken, async (req, res) => {
       const id = req.params.id;
-
       const query = { _id: new ObjectId(id) };
+
+      const parcel = await parcelCollection.findOne(query); // Agey khuje nite hobe
+      if (!parcel) return res.status(404).send({ message: "Parcel not found" });
 
       if (parcel.sender.email !== req.decoded.email) {
         return res.status(403).send({ message: "Forbidden access" });
@@ -211,7 +356,7 @@ async function run() {
 
     //pending riders
 
-    app.get("/riders/pending", verifyFbToken, async (req, res) => {
+    app.get("/riders/pending", verifyFbToken, verifyAdmin, async (req, res) => {
       try {
         const query = { status: "pending" };
         const result = await riderCollection.find(query).toArray();
@@ -224,7 +369,7 @@ async function run() {
 
     //active riders-->>
 
-    app.get("/riders/active", verifyFbToken, async (req, res) => {
+    app.get("/riders/active", verifyFbToken, verifyAdmin, async (req, res) => {
       try {
         const query = { status: "active" };
         const result = await riderCollection.find(query).toArray();
@@ -237,125 +382,285 @@ async function run() {
 
     //update (approve) status a rider -->>
 
-    app.patch("/riders/approve/:id", verifyFbToken, async (req, res) => {
-      try {
-        const id = req.params.id;
+    app.patch(
+      "/riders/approve/:id",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
 
-        // find rider first
-        const rider = await riderCollection.findOne({
-          _id: new ObjectId(id),
-        });
+          // find rider first
+          const rider = await riderCollection.findOne({
+            _id: new ObjectId(id),
+          });
 
-        if (!rider) {
-          return res.status(404).send({ message: "Rider not found" });
+          if (!rider) {
+            return res.status(404).send({ message: "Rider not found" });
+          }
+
+          const riderUpdate = await riderCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                status: "active",
+                approved_at: new Date().toISOString(),
+              },
+            },
+          );
+
+          const userUpdate = await userCollection.updateOne(
+            { email: rider.email },
+            {
+              $set: { role: "rider" },
+            },
+          );
+
+          console.log("userUpdate:", userUpdate);
+
+          res.send({
+            success: true,
+            riderUpdate,
+            userUpdate,
+          });
+        } catch (error) {
+          console.log(error);
+          res.status(500).send({ message: "Failed to approve rider" });
         }
-
-        const riderUpdate = await riderCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              status: "active",
-              approved_at: new Date().toISOString(),
-            },
-          },
-        );
-
-        const userUpdate = await userCollection.updateOne(
-          { email: rider.email },
-          {
-            $set: {
-              role: "rider",
-            },
-          },
-        );
-
-        res.send({
-          success: true,
-          riderUpdate,
-          userUpdate,
-        });
-      } catch (error) {
-        console.log(error);
-        res.status(500).send({ message: "Failed to approve rider" });
-      }
-    });
+      },
+    );
 
     //reject a rider-->>
 
-    app.patch("/riders/reject/:id", verifyFbToken, async (req, res) => {
-      try {
-        const id = req.params.id;
+    app.patch(
+      "/riders/reject/:id",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
 
-        const query = { _id: new ObjectId(id) };
+          const query = { _id: new ObjectId(id) };
 
-        const updateDoc = {
-          $set: {
-            status: "rejected",
-            rejected_at: new Date().toISOString(),
-          },
-        };
+          const updateDoc = {
+            $set: {
+              status: "pending",
+              rejected_at: new Date().toISOString(),
+            },
+          };
 
-        const result = await riderCollection.updateOne(query, updateDoc);
+          const result = await riderCollection.updateOne(query, updateDoc);
 
-        res.send(result);
-      } catch (error) {
-        console.log(error);
-        res.status(500).send({ message: "Failed to reject rider" });
-      }
-    });
+          res.send(result);
+        } catch (error) {
+          console.log(error);
+          res.status(500).send({ message: "Failed to reject rider" });
+        }
+      },
+    );
 
     //demote a active rider-->>
 
-    app.patch("/riders/demote/:id", verifyFbToken, async (req, res) => {
+    app.patch(
+      "/riders/demote/:id",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+
+          const rider = await riderCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!rider) {
+            return res.status(404).send({ message: "Rider not found" });
+          }
+
+          // rider status active -> pending
+          const riderUpdate = await riderCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                status: "pending",
+                demoted_at: new Date().toISOString(),
+              },
+              $unset: {
+                approved_at: "",
+              },
+            },
+          );
+
+          // user role rider -> user
+          const userUpdate = await userCollection.updateOne(
+            { email: rider.email },
+            {
+              $set: {
+                role: "user",
+              },
+            },
+          );
+
+          res.send({
+            success: true,
+            message:
+              "Rider has been changed to normal user and moved to pending.",
+            riderUpdate,
+            userUpdate,
+          });
+        } catch (error) {
+          console.log(error);
+          res.status(500).send({ message: "Failed to demote rider" });
+        }
+      },
+    );
+
+    //asign a rider-->>
+
+    app.get("/parcels-for-assignment", async (req, res) => {
       try {
-        const id = req.params.id;
+        const query = {
+          payment_status: "paid",
+          delivery_status: "not_collected",
+        };
 
-        const rider = await riderCollection.findOne({
-          _id: new ObjectId(id),
-        });
+        const parcels = await parcelCollection.find(query).toArray();
 
-        if (!rider) {
-          return res.status(404).send({ message: "Rider not found" });
+        res.send(parcels);
+      } catch (err) {
+        console.error("Error fetching parcels for assignment:", err);
+        res.status(500).send({ message: "Failed to fetch parcels" });
+      }
+    });
+
+    //available rider-->>
+
+    app.get("/riders/available", async (req, res) => {
+      try {
+        const { region, district } = req.query;
+
+        const query = {
+          region,
+          district,
+          status: "active",
+        };
+
+        const riders = await riderCollection.find(query).toArray();
+        res.send(riders);
+      } catch (err) {
+        console.error("Error fetching riders:", err);
+        res.status(500).send({ message: "Failed to fetch riders" });
+      }
+    });
+
+    //assign a rider-->>
+
+    app.patch("/parcels/assign/:id", async (req, res) => {
+      try {
+        const parcelId = req.params.id;
+        const { riderId, riderName, riderEmail, riderPhone } = req.body;
+
+        const updateDoc = {
+          $set: {
+            assigned_rider_id: riderId,
+            assigned_rider_name: riderName,
+            assigned_rider_email: riderEmail,
+            assigned_rider_phone: riderPhone,
+            assigned_at: new Date(),
+            delivery_status: "assigned",
+          },
+        };
+
+        const result = await parcelCollection.updateOne(
+          { _id: new ObjectId(parcelId) },
+          updateDoc,
+        );
+
+        res.send(result);
+      } catch (err) {
+        console.error("Error assigning rider:", err);
+        res.status(500).send({ message: "Failed to assign rider" });
+      }
+    });
+
+    //get rider task-->>
+
+    app.get("/rider/tasks", verifyFbToken, async (req, res) => {
+      try {
+        const riderEmail = req.decoded.email;
+
+        const query = {
+          assigned_rider_email: riderEmail,
+          delivery_status: { $in: ["assigned", "picked_up", "in_transit"] },
+        };
+
+        const result = await parcelCollection.find(query).toArray();
+        res.send(result);
+      } catch (err) {
+        console.error("Error fetching rider tasks:", err);
+        res.status(500).send({ message: "Failed to fetch rider tasks" });
+      }
+    });
+
+    //rideer actions-->>
+
+    app.patch("/rider/tasks/:id", verifyFbToken, async (req, res) => {
+      try {
+        const parcelId = req.params.id;
+        const riderEmail = req.decoded.email;
+        const { delivery_status } = req.body;
+
+        const allowedStatuses = ["picked_up", "in_transit", "delivered"];
+
+        if (!allowedStatuses.includes(delivery_status)) {
+          return res.status(400).send({ message: "Invalid delivery status" });
         }
 
-        // rider status active -> pending
-        const riderUpdate = await riderCollection.updateOne(
-          { _id: new ObjectId(id) },
+        const result = await parcelCollection.updateOne(
+          {
+            _id: new ObjectId(parcelId),
+            assigned_rider_email: riderEmail,
+          },
           {
             $set: {
-              status: "pending",
-              demoted_at: new Date().toISOString(),
-            },
-            $unset: {
-              approved_at: "",
+              delivery_status,
+              updated_at: new Date(),
             },
           },
         );
 
-        // user role rider -> user
-        const userUpdate = await userCollection.updateOne(
-          { email: rider.email },
-          {
-            $set: {
-              role: "user",
-            },
-          },
-        );
+        res.send(result);
+      } catch (err) {
+        console.error("Error updating rider task:", err);
+        res.status(500).send({ message: "Failed to update task" });
+      }
+    });
 
-        res.send({
-          success: true,
-          message:
-            "Rider has been changed to normal user and moved to pending.",
-          riderUpdate,
-          userUpdate,
-        });
-      } catch (error) {
-        console.log(error);
-        res.status(500).send({ message: "Failed to demote rider" });
+    //compleate delevaries-->
+
+    app.get("/rider/completed-tasks", verifyFbToken, async (req, res) => {
+      try {
+        const riderEmail = req.decoded.email;
+
+        const query = {
+          assigned_rider_email: riderEmail,
+          delivery_status: "delivered",
+        };
+
+        const result = await parcelCollection
+          .find(query)
+          .sort({ updated_at: -1 })
+          .toArray();
+
+        res.send(result);
+      } catch (err) {
+        console.error("Error fetching completed tasks:", err);
+        res.status(500).send({ message: "Failed to fetch completed tasks" });
       }
     });
 
     //payment api-->>
+
     app.post("/create-payment-intent", verifyFbToken, async (req, res) => {
       try {
         const { cost } = req.body;
@@ -382,6 +687,8 @@ async function run() {
     app.post("/payments", verifyFbToken, async (req, res) => {
       try {
         const paymentData = req.body;
+        paymentData.payment_status = "paid";
+        paymentData.created_at = new Date();
 
         const parcel = await parcelCollection.findOne({
           _id: new ObjectId(paymentData.parcelId),
@@ -399,7 +706,7 @@ async function run() {
 
         const updateDoc = {
           $set: {
-            status: "paid",
+            payment_status: "paid",
             transactionId: paymentData.transactionId,
           },
         };
